@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Session Name="D:\realtime-sleep\RS6x_7x_mmWave_sdk_V2.0.2\Software_Kit\02_SDK\psdf_sdk\project\mmwave\myproject\cdk_6240_cpuf\project.cdkws">
+  <int Value="0" Name="m_selectedTab"/>
+  <wxString Value="D:\realtime-sleep\RS6x_7x_mmWave_sdk_V2.0.2\Software_Kit\02_SDK\psdf_sdk\project\mmwave\myproject\cdk_6240_cpuf\project.cdkws" Name="m_workspaceName"/>
+  <TabInfoArray Name="TabInfoArray"/>
+  <SerializedObject Name="m_breakpoints">
+    <long Value="0" Name="Count"/>
+  </SerializedObject>
+</Session>
