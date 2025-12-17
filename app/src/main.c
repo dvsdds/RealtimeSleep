@@ -74,9 +74,25 @@ static int g_wake_count = 0;
 /*---------------------------------------------*/
 
 // 全局存储获取到的range fft数据，包括实部和虚部
-Complex16_RealImag buffer[RANGE_BIN_NUM + 1] __aligned(4);
+//Complex16_RealImag buffer[RANGE_BIN_NUM + 1] __aligned(4);
+Complex16_RealImag buffer[RANGE_BIN_NUM + 1]={0};
 int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM] = {0};
 int16_t imag_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM] = {0};
+
+// 用于choose_bin_final
+float phase_tmp[FRAME_BUFFER_SIZE];
+float phase_sequences[RANGE_BIN_NUM][FRAME_BUFFER_SIZE];
+float energies[RANGE_BIN_NUM];
+float auto_vals[RANGE_BIN_NUM];
+float scores[RANGE_BIN_NUM];
+float ac_pos[FRAME_BUFFER_SIZE];
+int   peaks[32];
+
+// 用于estimate_respiration_rate
+float phase[FRAME_BUFFER_SIZE];
+float phase_filtered[FRAME_BUFFER_SIZE];
+int   phase_filtered_peaks[32];
+float phase_filtered_bpm;
 
 typedef struct{
     int state;
@@ -265,172 +281,151 @@ static void compute_var_entropy_time(int16_t data[][RANGE_BIN_NUM], int num_fram
 // 目前存在的问题主要是获取相位的函数实现起来相对比较困难，需要用近似计算来替代
 #define FS  20.0f // 采样率 Hz
 #ifndef M_PI
-#define M_PI 3.14159f
+#define M_PI 3.14159265358979323846f
 #endif
 
-static float unwrap_phase(float prev, float current) {
-    float diff = current - prev;
+float unwrap_phase(float prev_unwrapped, float cur_raw)
+{
+    float two_pi = 2.0f * M_PI;
+    float prev_raw = fmodf(prev_unwrapped + M_PI, two_pi);
+    if (prev_raw < 0)
+        prev_raw += two_pi;
+    prev_raw -= M_PI;  
 
-    if (diff > M_PI) {
-        diff -= 2.0f * M_PI;
-    } else if (diff < -M_PI) {
-        diff += 2.0f * M_PI;
-    }
+    float diff = cur_raw - prev_raw;
 
-    return prev + diff;
+    float diff_mod = fmodf(diff + M_PI, two_pi);
+    if (diff_mod < 0)
+        diff_mod += two_pi;
+    diff_mod -= M_PI;
+
+    if (diff_mod == -M_PI && diff > 0)
+        diff_mod = M_PI;
+
+    return prev_unwrapped + diff_mod;
 }
 
-//static float sig_padded[FRAME_BUFFER_SIZE + 100];
-//
-//// 双窗口滤波
-//static void double_window_filter(float* phase_unwrapped, int n)
-//{
-//	int outer_win_size = 21;
-//	int inner_win_size = 3;
-//	float sigma_d = 5.0;
-//	float sigma_r = 0.5;
-//    int half_outer = outer_win_size / 2;
-//    int half_inner = inner_win_size / 2;
-//    int pad = half_outer + half_inner;
-//    int padded_len = n + 2 * pad;
-//
-//    // 边界扩展
-//    for (int i = 0; i < pad; i++)
-//        sig_padded[i] = phase_unwrapped[0];
-//    for (int i = 0; i < n; i++)
-//        sig_padded[i + pad] = phase_unwrapped[i];
-//    for (int i = 0; i < pad; i++)
-//        sig_padded[n + pad + i] = phase_unwrapped[n - 1];
-//
-//    // 双窗口滤波
-//    for (int i = 0; i < n; i++) {
-//        int i_center = i + pad;
-//        int outer_start = i_center - half_outer;
-//        int outer_end = i_center + half_outer;
-//
-//        float total_weight = 0.0;
-//        float weighted_sum = 0.0;
-//
-//        for (int j = outer_start; j <= outer_end; j++) {
-//            // 空间权重
-//            float dist_spatial = fabs((float)(i_center - j));
-//            float w_d = exp(-(dist_spatial * dist_spatial) / (2.0 * sigma_d * sigma_d));
-//
-//            // 值域权重（基于内窗口）
-//            float dist_range = 0.0;
-//            for (int k = -half_inner; k <= half_inner; k++) {
-//                float inner_i = sig_padded[i_center + k];
-//                float inner_j = sig_padded[j + k];
-//                dist_range += fabs(inner_i - inner_j);
-//            }
-//            float w_r = exp(-(dist_range * dist_range) / (2.0 * sigma_r * sigma_r));
-//
-//            float weight = w_d * w_r;
-//            total_weight += weight;
-//            weighted_sum += weight * sig_padded[j];
-//        }
-//
-//        if (total_weight > 0.0)
-//            phase_unwrapped[i] = (float)(weighted_sum / total_weight);
-//    }
-//}
+float sig_buffer[FRAME_BUFFER_SIZE + 200]={0};   
+float tmp_buffer[FRAME_BUFFER_SIZE + 200]={0};
 
-static float sig_buffer[FRAME_BUFFER_SIZE + 200];   
-static float tmp_buffer[FRAME_BUFFER_SIZE + 200];
-
-static void moving_average(const float* sig, float* out, int n, int window)
+// 反射填充函数
+void reflect_pad_numpy(const float* signal, float* padded, int n, int pad_width)
 {
-    if (window <= 1) {
+    int padded_len = n + 2 * pad_width;
+    if (n <= 0 || pad_width <= 0) return;
+
+    // 中间复制原信号
+    for (int i = 0; i < n; i++) {
+        padded[i + pad_width] = signal[i];
+    }
+
+    // 左填充：反射，不重复边界元素，即 padded[pad-1] = signal[1]
+    // 如果信号太短（n<=2），退化为重复边界
+    if (n >= 2) {
+        for (int i = 0; i < pad_width; i++) {
+            int src_idx = 1 + i;
+            if (src_idx >= n) src_idx = n - 1; // 保护
+            padded[pad_width - 1 - i] = signal[src_idx];
+        }
+    } else {
+        // n == 1 时直接复制第0元素
+        for (int i = 0; i < pad_width; i++) {
+            padded[pad_width - 1 - i] = signal[0];
+        }
+    }
+
+    // 右填充：signal[n-2], signal[n-3]...
+    if (n >= 2) {
+        for (int i = 0; i < pad_width; i++) {
+            int src_idx = n - 2 - i;
+            if (src_idx < 0) src_idx = 0;
+            padded[pad_width + n + i] = signal[src_idx];
+        }
+    } else {
+        for (int i = 0; i < pad_width; i++) {
+            padded[pad_width + n + i] = signal[0];
+        }
+    }
+}
+
+// 使用卷积计算移动平均
+void moving_average_conv(const float* sig, float* out, int n, int window_size)
+{
+    if (n <= 0) return;
+    if (window_size <= 1) {
+        // 直接拷贝
         for (int i = 0; i < n; i++) out[i] = sig[i];
         return;
     }
 
-    int right = window - 1;
-    if (right >= n) right = n - 1;
+    int pad_width = window_size / 2;
+    // 如果窗口超过信号长度，退化为整个信号均值（匹配 Python 的 behavior）
+    if (window_size >= n) {
+        float s = 0.0f;
+        for (int i = 0; i < n; i++) s += sig[i];
+        float mean = s / (float)n;
+        for (int i = 0; i < n; i++) out[i] = mean;
+        return;
+    }
 
-    float s = 0.0f;
-    for (int i = 0; i <= right; i++)
-        s += sig[i];
+    // 反射填充到 tmp_buffer（要求 tmp_buffer 大小 >= n + 2*pad_width）
+    reflect_pad_numpy(sig, tmp_buffer, n, pad_width);
 
-    int left = 0;
+    // 初始窗口求和（tmp_buffer 前 pad_width...）
+    float window_sum = 0.0f;
+    for (int i = 0; i < window_size; i++) {
+        window_sum += tmp_buffer[i];
+    }
 
-    for (int i = 0; i < n; i++)
-    {
-        int length = right - left + 1;
-        out[i] = s / (float)length;
-
-        // slide
-        s -= sig[left];
-        left++;
-        right++;
-
-        if (right < n)
-            s += sig[right];
-        else
-            s += sig[n - 1];   // edge padding
+    // 卷积 - 输出长度 n，对应 tmp_buffer 索引从 0..(n-1)
+    for (int i = 0; i < n; i++) {
+        out[i] = window_sum / (float)window_size;
+        // 滑动窗口：移除 tmp_buffer[i]，加入 tmp_buffer[i + window_size]
+        window_sum -= tmp_buffer[i];
+        window_sum += tmp_buffer[i + window_size];
     }
 }
 
-static void remove_bashline_drift(float* phase_unwrapped, int n)
+void remove_baseline_drift(float* signal, int n)
 {
-    const float fs = 20.0f;
-    const float win_len_big   = 5.0f;   // 大窗口
-    const float win_len_small = 1.7f;   // 小窗口
+    const float fs = FS;      // 20.0f
+    const float win_len = 3.0f;
 
-    int win_big   = (int)(fs * win_len_big);
-    int win_small = (int)(fs * win_len_small);
+    int window_size = (int)(fs * win_len);  // 60
+    // 保证为奇数以便中心对称（与 Python 的 window//2 行为一致并更稳定）
+    if (window_size % 2 == 0) window_size++;
 
-    if (win_big > n)   win_big = n;
-    if (win_small > n) win_small = n;
+    // 防止窗口过大
+    if (window_size > n) {
+        // 退化为 n(或最接近的奇数)
+        window_size = (n % 2 == 0) ? n - 1 : n;
+        if (window_size < 3) window_size = 3;
+    }
 
-    // 1. 大窗口求 baseline：tmp_buffer
-    moving_average(phase_unwrapped, tmp_buffer, n, win_big);
+    // tmp_buffer 作为 padded + 中间结果（预分配）
+    moving_average_conv(signal, tmp_buffer, n, window_size);
 
-    // corrected = signal - baseline → 放入 sig_buffer
-    for (int i = 0; i < n; i++)
-        sig_buffer[i] = phase_unwrapped[i] - tmp_buffer[i];
-
-    // 2. 小窗口平滑：输出直接写回 phase_unwrapped
-    moving_average(sig_buffer, phase_unwrapped, n, win_small);
+    // 原信号减去 baseline
+    for (int i = 0; i < n; i++) {
+        signal[i] -= tmp_buffer[i];
+    }
 }
 
 // butterworth带通滤波
-#define FILTER_ORDER 8
-
-//static float b[FILTER_ORDER + 1] = {
-//    1.32937289e-05f,  0.00000000e+00f, -5.31749156e-05f,  0.00000000e+00f,
-//    7.97623734e-05f,  0.00000000e+00f, -5.31749156e-05f,  0.00000000e+00f,
-//    1.32937289e-05f
-//};
-
-static float b[FILTER_ORDER + 1] = {
-    3.12389769e-05f,  
-    0.00000000e+00f,  
-    -1.24955908e-04f, 
-    0.00000000e+00f,  
-    1.87433862e-04f,  
-    0.00000000e+00f,  
-    -1.24955908e-04f, 
-    0.00000000e+00f, 
-    3.12389769e-05f  
+#define FILTER_ORDER 4
+float b[FILTER_ORDER + 1] = {
+	0.00554272f, 
+	0.0000000f, 
+	-0.01108543f, 
+	0.00000000f, 
+	0.00554272f
 };
-
-//static float a[FILTER_ORDER + 1] = {
-//    1.00000000f,  -7.65278270f,  25.64597452f, -49.15718723f,
-//    58.94461344f, -45.27863033f,  21.75890323f,  -5.98080126f,
-//    0.71991033f
-//};
-
-static float a[FILTER_ORDER + 1] = {
-    1.0f,          
-    -7.56722638f,   
-    25.08216965f,  
-    -47.56384375f,  
-    56.44130747f,   
-    -42.91716792f,  
-    20.42130903f,  
-    -5.55955857f,   
-    0.66301048f     
+float a[FILTER_ORDER + 1] = {
+	1.00000000f, 
+	-3.76742617f, 
+	5.33686791f, 
+	-3.37021291f, 
+	0.80080265f 
 };
 
 float x_history[FILTER_ORDER] = {0};
@@ -438,18 +433,14 @@ float y_history[FILTER_ORDER] = {0};
 int filter_initialized = 0;
 
 // 初始化滤波器（重置历史数据）
-static void init_filter(void) {
+void init_filter(void) {
     memset(x_history, 0, FILTER_ORDER * sizeof(float));
     memset(y_history, 0, FILTER_ORDER * sizeof(float));
     filter_initialized = 1;
 }
 
 // 对单个样本进行滤波
-static float filter_sample(float x_n) {
-    if (!filter_initialized) {
-        init_filter();
-    }
-    
+float filter_sample(float x_n) {
     float acc = b[0] * x_n;
 
     // 累加历史项
@@ -473,7 +464,7 @@ static float filter_sample(float x_n) {
 }
 
 // 对整个数组进行滤波
-static void filter_array(float *x, float *y, int n) {
+void filter_array(float *x, float *y, int n) {
 	init_filter();
     
     for (int i = 0; i < n; i++) {
@@ -481,78 +472,30 @@ static void filter_array(float *x, float *y, int n) {
     }
 }
 
-#define MIN_PEAK_DISTANCE (int)(FS * 0.6)  // 峰间最小距离（0.6秒）
-static int peaks[512];
+#define MIN_PEAK_DISTANCE (int)(FS * 2.0)  // 峰间最小距离（0.6秒）
 //
-//// 检测峰值
-//static int find_peaks(const float *signal, int length, int *peaks, int max_peaks) {
-//    int count = 0;
-//    int last_peak = -MIN_PEAK_DISTANCE;
-//
-//    for (int i = 1; i < length - 1; i++) {
-//        // 简单的局部极大值检测
-//        if (signal[i] > signal[i - 1] && signal[i] > signal[i + 1]) {
-//            // 距离约束：相邻峰至少间隔 MIN_PEAK_DISTANCE
-//            if (i - last_peak >= MIN_PEAK_DISTANCE) {
-//                if (count < max_peaks) {
-//                    peaks[count++] = i;
-//                    last_peak = i;
-//                }
-//            }
-//        }
-//    }
-//
-//    return count;  // 返回检测到的峰数量
-//}
-
-static int find_peaks_improved(const float *signal, int length, int *peaks, int max_peaks) {
+// 检测峰值
+int find_peaks(const float *signal, int length, int *peaks, int max_peaks) {
     int count = 0;
-    int window = FS / 2;  // 0.5秒窗口
-    
-    for (int i = window; i < length - window; i++) {
-        // 检查是否为窗口内的最大值
-        int is_peak = 1;
-        float max_val = signal[i];
-        
-        for (int j = i - window; j <= i + window; j++) {
-            if (j == i) continue;
-            if (signal[j] >= max_val) {
-                is_peak = 0;
-                break;
-            }
-        }
-        
-        if (is_peak) {
-            // 距离检查
-            int valid = 1;
-            for (int p = 0; p < count; p++) {
-                if (abs(i - peaks[p]) < MIN_PEAK_DISTANCE) {
-                    // 如果找到更近的峰值，保留更高的那个
-                    if (signal[i] > signal[peaks[p]]) {
-                        peaks[p] = i;  // 替换为更高的峰值
-                    }
-                    valid = 0;
-                    break;
+    int last_peak = -MIN_PEAK_DISTANCE;
+
+    for (int i = 1; i < length - 1; i++) {
+        // 简单的局部极大值检测
+        if (signal[i] > signal[i - 1] && signal[i] > signal[i + 1]) {
+            // 距离约束：相邻峰至少间隔 MIN_PEAK_DISTANCE
+            if (i - last_peak >= MIN_PEAK_DISTANCE) {
+                if (count < max_peaks) {
+                    peaks[count++] = i;
+                    last_peak = i;
                 }
-            }
-            
-            if (valid && count < max_peaks) {
-                peaks[count++] = i;
             }
         }
     }
-    
-    return count;
+    return count;  // 返回检测到的峰数量
 }
 
 // 呼吸率计算
-static float compute_breath_rate(const float *signal, int length) {
-    int num_peaks = find_peaks_improved(signal, length, peaks, 512);
-	printf("num_peaks:%d\n",num_peaks);
-	for(int i=0;i<num_peaks;i++){
-		printf("%d ",peaks[i]);
-	}
-	printf("\n");
+float compute_breath_rate(const float *signal, int length, int num_peaks, int *peaks) {
 
     if (num_peaks < 2) return 0.0; // 峰太少，无法计算
 
@@ -569,7 +512,7 @@ static float compute_breath_rate(const float *signal, int length) {
     return bpm;
 }
 
-static float compute_mean(float* phase)
+float compute_mean(float* phase)
 {
 	float mean = 0.0f;
 	for (int t = 0; t < FRAME_BUFFER_SIZE; t++) mean += phase[t];
@@ -577,14 +520,7 @@ static float compute_mean(float* phase)
 	return mean;
 }
 
-static float phase_tmp[FRAME_BUFFER_SIZE] = {0};
-static float phase_sequences[RANGE_BIN_NUM][FRAME_BUFFER_SIZE] = {0};
-static float energies[RANGE_BIN_NUM] = {0};
-static float auto_vals[RANGE_BIN_NUM] = {0};
-static float scores[RANGE_BIN_NUM] = {0};
-static float ac_pos[FRAME_BUFFER_SIZE] = {0};
-
-static int choose_bin(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM],
+int choose_bin(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM],
 				int16_t imag_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM])
 {
 	float w_auto = 0.6f;     // 周期性最重要
@@ -604,7 +540,7 @@ static int choose_bin(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM],
         }
 
 //		double_window_filter(phase_tmp, FRAME_BUFFER_SIZE);
-		remove_bashline_drift(phase_tmp, FRAME_BUFFER_SIZE);
+		remove_baseline_drift(phase_tmp, FRAME_BUFFER_SIZE);
 	
 		// 仅用于自相关，不需要那么精确，不用滤波，缩短执行时间			
 
@@ -641,7 +577,7 @@ static int choose_bin(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM],
 		// 先计算均值
 		float x_mean = compute_mean(phase_sequences[b]);
 		
-		// 计算自相关（非中心化方式，与Python代码一致）
+		// 计算自相关
 		for (int lag = 0; lag < N; lag++) {
 			double sum = 0.0;
 			int limit = N - lag;
@@ -653,7 +589,7 @@ static int choose_bin(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM],
 			ac_pos[lag] = (float)sum;
 		}
 		
-		int peak_count = find_peaks_improved(ac_pos, N, peaks, 512);
+		int peak_count = find_peaks(ac_pos, N, peaks, 32);
 		if (peak_count < 2) {
 			auto_vals[b] = 0.0f;   
 		} else {
@@ -683,20 +619,17 @@ static int choose_bin(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM],
             best_bin = b;
         }
     }
-    printf("best_bin = %d\n", best_bin);
 	return best_bin;
 }
 
-
-static float phase[FRAME_BUFFER_SIZE];
-static float phase_filtered[FRAME_BUFFER_SIZE];
 // 主函数：计算呼吸率 (bpm)
-static float estimate_respiration_rate(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM],
+float estimate_respiration_rate(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM],
                                 int16_t imag_data[FRAME_BUFFER_SIZE][RANGE_BIN_NUM])
 {
 	
 	// 1. 选择bin（只做预处理，不做完整滤波）
     int best_bin = choose_bin(real_data, imag_data);
+//	printf("best_bin:%d\n",best_bin);
 	
 	// 2. 提取目标bin的原始相位
 	float prev_phase = atan2f((float)imag_data[0][best_bin], (float)real_data[0][best_bin]);
@@ -709,15 +642,18 @@ static float estimate_respiration_rate(int16_t real_data[FRAME_BUFFER_SIZE][RANG
 	
 	// 3. 滤波
 //	double_window_filter(phase, FRAME_BUFFER_SIZE);
-	remove_bashline_drift(phase, FRAME_BUFFER_SIZE);
+	remove_baseline_drift(phase, FRAME_BUFFER_SIZE);
 	
 	// 4. 带通滤波
+	init_filter();
 	filter_array(phase, phase_filtered, FRAME_BUFFER_SIZE);
 	
     // 5. 计算呼吸率
-    float bpm = compute_breath_rate(phase_filtered, FRAME_BUFFER_SIZE);
+	int num_peaks = find_peaks(phase_filtered, FRAME_BUFFER_SIZE, phase_filtered_peaks, 32);
+    phase_filtered_bpm = compute_breath_rate(phase_filtered, FRAME_BUFFER_SIZE, num_peaks, phase_filtered_peaks);
+//	printf("bpm:%.2f\n",phase_filtered_bpm);
 	
-    return bpm;
+    return phase_filtered_bpm;
 }
 //---------------------------------------------------------
 
@@ -825,7 +761,7 @@ static void mmw_data_process(void *mmw_data) {
 		// 天线5，从0开始
 		// 1 0：
         int tx = 0, rx = 0;
-        ret = mmw_fft_data(buffer, RANGE_BIN_NUM, tx, rx, 12);
+        ret = mmw_fft_data(buffer, RANGE_BIN_NUM+1, tx, rx, 16);
         if (ret) {
             printf("mmw_fft_data error! %d\n", ret);
             return;
@@ -845,7 +781,7 @@ static void mmw_data_process(void *mmw_data) {
         }
 
         if (frame_count >= FRAME_BUFFER_SIZE) {
-			printf("Range FFT Data Collection Full!\n");
+//			printf("Range FFT Data Collection Full!\n");
             // 收满后判定睡眠状态
             SleepStatusResult sleep_status = judge_sleep_status(real_data, imag_data, FRAME_BUFFER_SIZE);
             if (sleep_status.state == STATUS_OFF_BED) {
@@ -1092,7 +1028,7 @@ void mmw_init_range(){
     if(ret) {
         printk("Interval cfg error! %d\n", ret);
     }
-    ret = mmw_frame_cfg(100, 0);
+    ret = mmw_frame_cfg(50, 0);
     if (ret) {
         printk("frame cfg error! %d\n", ret);
     }
@@ -1162,9 +1098,3 @@ int main(void) {
 
     return 0;
 }
-
-/*
- ******************************************************************************
- * (C) COPYRIGHT POSSUMIC TECHNOLOGY
- * END OF FILE
- */
