@@ -38,9 +38,9 @@ double range_array[3][2] = {{-60, 60}, {30, 200}, {-75, 60}};
 #define STATUS_NONE 0 // 床上有人，包括环境内无人或者框外有人
 #define STATUS_ON_BED 1 // 上床
 #define STATUS_ACTIVE 2 // 床上活动
-#define STATUS_TRANSITION 3 // 过渡状态
-#define STATUS_SLEEP 4 // 睡眠
-#define STATUS_OFF_BED 5 // 离床
+//#define STATUS_TRANSITION 3  过渡状态
+#define STATUS_SLEEP 3 // 睡眠
+#define STATUS_OFF_BED 4 // 离床
 
 static int point_num_array[FRAME_BUFFER_SIZE];
 static int inside_array[FRAME_BUFFER_SIZE];
@@ -147,20 +147,53 @@ int judge_bed_status(int *point_nums, int *inside_nums, int *outside_nums,
 
     int inside_point_num = inside_nums[best_idx];
     int outside_point_num = outside_nums[best_idx];
+	float on_bed_ratio = 0.3; // 在床上活动的时候可能没有上床时候点数多，需要乘以一个系数调整
 
     // DEBUG 信息
 //	printf("[DEBUG] MaxIdx=%d, MaxPoints=%d, Inside=%d, Outside=%d\n", best_idx, max_points, inside_point_num, outside_point_num);
 
     // 判定逻辑
-    if (inside_point_num >= inside_th && inside_point_num >= outside_point_num) {
-        return STATUS_ON_BED;   // 上床
-    } else if (max_points <= none_th) {
-        return STATUS_NONE;   // 无人
-    } else if (outside_point_num >= outside_th && outside_point_num > inside_point_num) {
-        return STATUS_NONE;   // 框外有人
-    }
+//    if (inside_point_num >= inside_th && inside_point_num >= outside_point_num) {
+//        return STATUS_ON_BED;   // 上床
+//    } else if (max_points <= none_th) {
+//        return STATUS_NONE;   // 无人
+//    } else if (outside_point_num >= outside_th && outside_point_num > inside_point_num) {
+//        return STATUS_NONE;   // 框外有人
+//    }
+	switch (g_state){
+		case STATUS_NONE:
+			if (inside_point_num >= inside_th && inside_point_num >= outside_point_num) {
+				return STATUS_ON_BED;   // 上床
+			}else{
+				return STATUS_NONE;
+			}
+		case STATUS_ON_BED: // 和active基本上一个判断逻辑
+			if (inside_point_num >= inside_th * on_bed_ratio && inside_point_num >= outside_point_num){
+				return STATUS_ACTIVE;
+			}
+			else if (outside_point_num >= outside_th && outside_point_num > inside_point_num){
+				return STATUS_OFF_BED;
+			}
+			else{
+				// 需要进行切换
+				return STATUS_SLEEP;
+			}
+		case STATUS_ACTIVE:
+			if(inside_point_num < inside_th * on_bed_ratio){
+				// 需要进行切换
+				return STATUS_SLEEP;
+			}else if(outside_point_num >= outside_th && outside_point_num > inside_point_num){
+				return STATUS_OFF_BED;
+			}
+		case STATUS_OFF_BED:
+			if (inside_point_num >= inside_th && inside_point_num >= outside_point_num) {
+				return STATUS_ON_BED;   // 上床
+			}else if(outside_point_num >= outside_th && outside_point_num > inside_point_num){
+				return STATUS_NONE;   // 彻底离开
+			}
 
-    return STATUS_NONE; // 默认无人
+//    return STATUS_NONE;  默认无人
+    }
 }
 
 // ================= Range-FFT 处理函数 ==================
@@ -658,6 +691,8 @@ float estimate_respiration_rate(int16_t real_data[FRAME_BUFFER_SIZE][RANGE_BIN_N
 //---------------------------------------------------------
 
 // ===================== 主判定函数 =====================
+// TODO 这个函数需要修改一下，现在只有睡眠状态能够用到这个东西，识别到ACTIVE状态之后要给出一个信号量让其切换到点云状态
+// 其他任何所有逻辑都不要改变
 SleepStatusResult judge_sleep_status(int16_t real_data[][RANGE_BIN_NUM], int16_t imag_data[][RANGE_BIN_NUM], int num_frames)
 {
     SleepStatusResult result = {0};
@@ -683,69 +718,25 @@ SleepStatusResult judge_sleep_status(int16_t real_data[][RANGE_BIN_NUM], int16_t
     }
 
     // 3. 状态机逻辑
-    int score_sleep = 0, score_wake = 0;
-    if (overall_var <= OVERALL_VAR_SLEEP) score_sleep++;
-    if (max_var <= BIN_VAR_SLEEP) score_sleep++;
-    if (median_entropy >= ENTROPY_SLEEP) score_sleep++;
+    // int score_sleep = 0, 
+    int score_wake = 0;
+    // if (overall_var <= OVERALL_VAR_SLEEP) score_sleep++;
+    // if (max_var <= BIN_VAR_SLEEP) score_sleep++;
+    // if (median_entropy >= ENTROPY_SLEEP) score_sleep++;
 
     if (overall_var > OVERALL_VAR_WAKE) score_wake++;
     if (max_var > BIN_VAR_WAKE) score_wake++;
     if (median_entropy < ENTROPY_WAKE) score_wake++;
-
-    switch (g_state) {
-        case STATUS_ACTIVE:
-            if (score_sleep >= 2) {
-                g_sleep_count++;
-                if (g_sleep_count >= SLEEP_WINDOW) {
-                    g_state = STATUS_SLEEP;
-                    g_sleep_count = 0;
-                } else {
-                    g_state = STATUS_TRANSITION;
-                }
-            } else {
-                g_sleep_count = 0;
-                g_state = STATUS_ACTIVE;
-            }
-            break;
-        case STATUS_SLEEP:
-            if (score_wake >= 2) {
-                g_wake_count++;
-                if (g_wake_count >= SLEEP_WINDOW) {
-                    g_state = STATUS_ACTIVE;
-                    g_wake_count = 0;
-                } else {
-                    g_state = STATUS_TRANSITION;
-                }
-            } else {
-                g_wake_count = 0;
-				// 睡眠时可尝试估计呼吸率
-				bpm = estimate_respiration_rate(real_data, imag_data);
-            }
-            break;
-        case STATUS_TRANSITION:
-            if (score_sleep >= 2) {
-                g_sleep_count++;
-                if (g_sleep_count >= SLEEP_WINDOW) {
-                    g_state = STATUS_SLEEP;
-                    bpm = estimate_respiration_rate(real_data, imag_data);
-                    g_sleep_count = 0;
-                }
-            } else if (score_wake >= 2) {
-                g_wake_count++;
-                if (g_wake_count >= SLEEP_WINDOW) {
-                    g_state = STATUS_ACTIVE;
-                    g_wake_count = 0;
-                }
-            }
-            break;
-        default:
+    // 只判清醒，其他状态全都不判
+    if (score_wake >= 2) {
+        g_wake_count++;
+        if (g_wake_count >= SLEEP_WINDOW) {
             g_state = STATUS_ACTIVE;
-            g_sleep_count = 0;
             g_wake_count = 0;
-            break;
+        }
+    }else{
+        bpm = estimate_respiration_rate(real_data, imag_data);
     }
-
-
     result.state = g_state;
     result.bpm = bpm;
     return result;
@@ -784,16 +775,17 @@ static void mmw_data_process(void *mmw_data) {
 //			printf("Range FFT Data Collection Full!\n");
             // 收满后判定睡眠状态
             SleepStatusResult sleep_status = judge_sleep_status(real_data, imag_data, FRAME_BUFFER_SIZE);
-            if (sleep_status.state == STATUS_OFF_BED) {
+            // 20251218 修改一下判定状态，睡眠时候活动过强直接切回点云模式
+            if (sleep_status.state == STATUS_ACTIVE) {
 //				printf("Sleep Status: Off bed\n");
 				printf("%d\n", sleep_status.state);
-                // 离床：切回点云模式
+                // 切回点云模式
                 switch_to_point = true;
                 int ret = mmw_ctrl_stop();
                 if (ret) {
                     printf("mmw_ctrl_stop error: %d\n", ret);
                 }
-                g_state = STATUS_ON_BED; // 重置状态机
+                g_state = STATUS_ACTIVE; // 重置状态机
                 frame_count = 0;
             } else if (sleep_status.state == STATUS_SLEEP) {
                 printf("%d\t%d\n", sleep_status.state, sleep_status.bpm);
@@ -829,7 +821,7 @@ static int detection3d_cpuf_cb(Detection3D_Data *data, Detection3D_State *state,
                                       5,    // none 阈值 (可调)
                                       20);  // outside 阈值 (可调)
         printf("%d\n", result);
-        if (result == STATUS_ON_BED) {
+        if (result == STATUS_SLEEP) {
             frame_count = 0;
 			switch_to_range = true; // 判定为上床，切换至range fft模式
 //			printf("Bed Status: On bed\n");
